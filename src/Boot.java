@@ -1,4 +1,5 @@
 import java.awt.AWTException;
+import java.awt.FontFormatException;
 import java.awt.GridLayout;
 import java.awt.MenuItem;
 import java.awt.PopupMenu;
@@ -14,8 +15,9 @@ import java.io.InputStreamReader;
 import java.net.InetAddress;
 import java.net.URL;
 import java.net.UnknownHostException;
-
+import java.sql.Timestamp;
 import javax.swing.JButton;
+import javax.swing.JComboBox;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
 import javax.swing.JTextField;
@@ -37,119 +39,149 @@ import org.pcap4j.packet.UdpPacket;
 import org.pcap4j.packet.namednumber.IpNumber;
 
 public class Boot {
+	public static Double version = 1.08;
 	private static InetAddress addr = null;
-	
-	public static void main(String[] args){
-		try {
-			setupTray();
-			
-			for(PcapNetworkInterface i : Pcaps.findAllDevs()){
-				for(PcapAddress x : i.getAddresses()){
-					if(x.getBroadcastAddress() != null && x.getBroadcastAddress().toString().equals("/0.0.0.0")){
-							addr = x.getAddress();
-					}
-				}
-			}
-			
-			if(addr == null){
-				getLocalAddr();
-			}
-			PcapNetworkInterface nif = Pcaps.getDevByAddress(addr);
-			System.out.println("Operating on device with MAC: " + nif.getLinkLayerAddresses().get(0));
 
-			int snapLen = 65536;
-			PromiscuousMode mode = PromiscuousMode.PROMISCUOUS;
-			int timeout = 0;
+	public static void main(String[] args) throws UnsupportedLookAndFeelException, AWTException, ClassNotFoundException, FontFormatException{
+		try {
+			if(!Sanity.check()){
+				System.exit(1);
+			}
+			setupTray();
+
+			getLocalAddr();
+			PcapNetworkInterface nif = Pcaps.getDevByAddress(addr);
+
+			final int snapLen = 65536;
+			final PromiscuousMode mode = PromiscuousMode.PROMISCUOUS;
+			final int timeout = 0;
 			PcapHandle handle = nif.openLive(snapLen, mode, timeout);
 
 			short pckCount = 0;
-			long lastPacketTime = 0;
+			Timestamp requestTime = null;
+			boolean expectPong = false;
 			String currSrv = null;
 			Overlay ui = new Overlay();
 
-			while(true){
+			while(true){				
 				Packet packet = handle.getNextPacket();
-				
+
 				if(packet != null){
 					IpV4Packet ippacket = packet.get(IpV4Packet.class);
-					
+
 					if(ippacket != null){
-						if(ippacket.getHeader().getProtocol() == IpNumber.UDP && !ippacket.getHeader().getSrcAddr().isSiteLocalAddress()){
+						if(ippacket.getHeader().getProtocol() == IpNumber.UDP){
 							UdpPacket udppack = ippacket.get(UdpPacket.class);
 							String srcAddrStr = ippacket.getHeader().getSrcAddr().toString(); // Shows as '/0.0.0.0'
 
-							if(udppack.getPayload().getRawData().length == 4){ //Leave/Join packet is always payload length 4
-								if(lastPacketTime == 0 || System.currentTimeMillis() - lastPacketTime < 10000){
+							if(!srcAddrStr.equals(currSrv)){ //Packets are STUN related: 56 is request, 68 is response
+								if(udppack.getPayload().getRawData().length == 56 && ippacket.getHeader().getSrcAddr().isSiteLocalAddress()){
+									requestTime = handle.getTimestamp();
+									expectPong = true;
+								}
+								else if(udppack.getPayload().getRawData().length == 68 && !ippacket.getHeader().getSrcAddr().isSiteLocalAddress()){
 									pckCount++;
 
-									if(pckCount == 3){ //3 of the leave/join packet are always sent in rapid succession	
-										if(!srcAddrStr.equals(currSrv)){ //TODO: Bugfix - Joining same killer twice won't trigger a lookup
-											geolocate(srcAddrStr, ui);
-											currSrv = srcAddrStr; //This serves to prevent seeing the message upon joining then leaving
-										}
+									if(pckCount == 4){ //The new packet is sent multiple times, we only really need 4 to confirm
+										ui.setKillerLocale("***");
+										geolocate(srcAddrStr, ui);
+										currSrv = srcAddrStr; //This serves to prevent seeing the message upon joining then leaving
 										pckCount = 0;
 									}
-								}else{ //If the packets take more than 10 secs, probably wrong packet
-									lastPacketTime = 0;
-									pckCount = 0;
+								}
+							}else{
+								if(expectPong && udppack.getPayload().getRawData().length == 68 && ippacket.getHeader().getDstAddr().isSiteLocalAddress()){
+									ui.setPing(handle.getTimestamp().getTime() - requestTime.getTime());
+									expectPong = false;
 								}
 							}
 						}
 					}
 				}
 			}
-		} catch (PcapNativeException | NotOpenException 
-				| ClassNotFoundException | InstantiationException 
-				| IllegalAccessException | UnsupportedLookAndFeelException 
-				| IOException | ParseException 
-				| AWTException | InterruptedException e) {
+		} catch (PcapNativeException | NotOpenException | InstantiationException | IllegalAccessException
+				| IOException | ParseException | InterruptedException e) {
 			e.printStackTrace();
 		}
 
 	}
-	
+
 	public static void setupTray() throws AWTException{
 		final SystemTray tray = SystemTray.getSystemTray();
-		
+
 		ActionListener listener = new ActionListener() {
-	        public void actionPerformed(ActionEvent e) {
-	            System.exit(0);
-	        }
-	    };
-	    PopupMenu popup = new PopupMenu();
-	    MenuItem exit = new MenuItem();
-	    exit.addActionListener(listener);
-	    exit.setLabel("Exit");
-	    popup.add(exit);
-		tray.add(new TrayIcon(Toolkit.getDefaultToolkit().getImage("icon.png"), "MLGA", popup));
+			public void actionPerformed(ActionEvent e) {
+				System.exit(0);
+			}
+		};
+		final PopupMenu popup = new PopupMenu();
+		final MenuItem exit = new MenuItem();
+		exit.addActionListener(listener);
+		exit.setLabel("Exit");
+		popup.add(exit);
+		final TrayIcon trayIcon = new TrayIcon(Toolkit.getDefaultToolkit().getImage(ClassLoader.getSystemResource("resources/icon.png")), "MLGA", popup);
+		tray.add(trayIcon);
+		Runtime.getRuntime().addShutdownHook(new Thread() {
+		    public void run() {
+		        tray.remove(trayIcon);
+		    }
+		});
 	}
-	
+
 	public static void geolocate(String ip, Overlay ui) throws IOException, ParseException{
 		String code = null;
-		URL url = new URL("http://freegeoip.net/json" + ip);
+		Long proxy = 0L;
 
-		try (InputStream is = url.openStream();
+		try (InputStream is = new URL("http://legacy.iphub.info/api.php?showtype=4&ip=" + ip.replace("/", "")).openStream();
 				BufferedReader buf = new BufferedReader(new InputStreamReader(is))) {
 			JSONParser parser = new JSONParser();
 			JSONObject obj = (JSONObject)parser.parse(buf);
-			code = (String)obj.get("country_code");
+			if(ui.useCountryName()){
+				code = (String)obj.get("countryName");
+			}else{
+				code = (String)obj.get("countryCode");
+			}
+			proxy = (Long)obj.get("proxy");
 		}
 		ui.setKillerLocale(code);
+		if(proxy != 0L){ //Could abuse anything non-zero being true, but probably shouldn't.
+			ui.setProxy(true);
+		}else{
+			ui.setProxy(false);
+		}
+
 	}
-	
-	public static void getLocalAddr() throws InterruptedException{
-		JFrame frame = new JFrame("MLGA Network Device Locate");
+
+	public static void getLocalAddr() throws InterruptedException, PcapNativeException{
+		final JFrame frame = new JFrame("MLGA Network Device Locate");
 		frame.setFocusableWindowState(true);
-		
-		JLabel ipLab = new JLabel("Enter LAN IP:", JLabel.LEFT);
-		JLabel exLab = new JLabel("(Ex. 192.168.0.2 or 10.0.0.2, obtained from Network Settings)", JLabel.LEFT);
-		JTextField lanIP = new JTextField();
-		lanIP.setSize(200, 20);
-		JButton start = new JButton("Start");
+
+		final JLabel ipLab = new JLabel("Select LAN IP obtained from Network Settings:", JLabel.LEFT);
+		final JComboBox<String> lanIP = new JComboBox<String>();
+		final JLabel lanLabel = new JLabel("If your device IP isn't in the dropdown, provide it below.");
+		final JTextField lanText = new JTextField();
+
+		for(PcapNetworkInterface i : Pcaps.findAllDevs()){
+			for(PcapAddress x : i.getAddresses()){
+				if(x.getAddress() != null && x.getNetmask() != null){
+					lanIP.addItem(x.getAddress().getHostAddress());
+				}
+			}
+		}
+
+		if(lanIP.getItemCount() == 0){
+			lanIP.addItem("No devices found. Try running in Admin mode.");
+		}
+
+		final JButton start = new JButton("Start");
 		start.addActionListener(new ActionListener(){
 			public void actionPerformed(ActionEvent e){
 				try {
-					addr = InetAddress.getByName(lanIP.getText());
+					if(lanText.getText().length() >= 7){ // 7 is because the minimum field is 0.0.0.0
+						addr = InetAddress.getByName(lanText.getText());
+					}else{
+						addr = InetAddress.getByName((String)lanIP.getSelectedItem());
+					}
 					frame.setVisible(false);
 					frame.dispose();
 				} catch (UnknownHostException e1) {
@@ -157,19 +189,20 @@ public class Boot {
 				}
 			}
 		});
-		
-		frame.setLayout(new GridLayout(4,1));
+
+		frame.setLayout(new GridLayout(5,1));
 		frame.add(ipLab);
-		frame.add(exLab);
 		frame.add(lanIP);
+		frame.add(lanLabel);
+		frame.add(lanText);
 		frame.add(start);
 		frame.setAlwaysOnTop(true);
 		frame.pack();
 		frame.setLocation(5, 420);
-		frame.setSize(400, 150);
+		frame.setSize(400, 175);
 		frame.setVisible(true);
-		frame.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
-		
+		frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+
 		while(frame.isVisible()){
 			Thread.sleep(10);
 		}
